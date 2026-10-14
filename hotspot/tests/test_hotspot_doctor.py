@@ -84,6 +84,16 @@ class ClassificationTest(unittest.TestCase):
         self.assertEqual(inc.strong[0].key, "idle_timeout")
         self.assertIn("Timeout message received", inc.strong[0].evidence[0])
 
+    def test_dropped_timeout_messages_are_not_a_cause(self):
+        lines = (
+            "2026-10-14 16:10:00.000  1 2 I SoftApManager[ap0]: Timeout message received but has clients. "
+            "Dropping.",
+            "2026-10-14 16:10:01.000  1 2 I SoftApManager[ap0]: Timeout message received while timeout is "
+            "disabled. Dropping.",
+            "2026-10-14 16:10:02.000  1 2 D SoftApManager[ap0]: Soft AP is stopped",
+        )
+        self.assertNotIn("idle_timeout", [h.key for h in self.only(lines).strong])
+
     def test_app_is_named_through_uid(self):
         inc = self.only(APP_STOP_LOG, {10234: ["net.dinglisch.android.taskerm"]})
         self.assertEqual(inc.strong[0].key, "actor_app")
@@ -258,6 +268,52 @@ class EndToEndTest(unittest.TestCase):
         self.assertIn("shell settings put global wifi_wakeup_enabled 0", calls)
         self.assertNotIn("low_power 0", calls)
         self.assertNotIn("tether_offload_disabled", calls)
+        self.assertNotIn("force-overlay-config-value", calls)
+        self.assertNotIn("am start", calls)
+
+    def test_fix_on_android16_extends_timeout_and_opens_settings(self):
+        self.responses({
+            "get-state": "device\n",
+            "shell getprop": "[ro.build.version.sdk]: [36]\n",
+            "shell settings list global": "wifi_wakeup_enabled=0\n",
+            "shell cmd wifi force-overlay-config-value": "true\n",
+            "shell am start -a com.android.settings.WIFI_TETHER_SETTINGS":
+                "Error: Activity not started, unable to resolve Intent\n",
+            "shell am start -a android.settings.TETHER_SETTINGS": "Starting: Intent { act=... }\n",
+        })
+        rc, out = self.run_main("fix", "--yes")
+        self.assertEqual(rc, 0)
+        calls = self.calls.read_text()
+        self.assertIn("shell cmd wifi force-overlay-config-value integer "
+                      "config_wifiFrameworkSoftApShutDownTimeoutMilliseconds enabled 2147483647", calls)
+        self.assertIn("shell am start -a android.settings.TETHER_SETTINGS", calls)
+        self.assertNotIn("soft_ap_timeout_enabled", calls)
+        self.assertNotIn("NEIZDEVĀS", out)
+        self.assertIn("config_wifiFrameworkSoftApShutDownTimeoutMilliseconds disabled", out)  # revert hint
+
+    def test_fix_without_timeout_override(self):
+        self.responses({
+            "get-state": "device\n",
+            "shell getprop": "[ro.build.version.sdk]: [36]\n",
+            "shell cmd wifi force-overlay-config-value":
+                "Exception occurred while executing 'force-overlay-config-value':\n"
+                "java.lang.SecurityException: Uid 2000 does not have access to force-overlay-config-value "
+                "wifi command (or such command doesn't exist)\n",
+        })
+        rc, out = self.run_main("fix", "--yes")
+        self.assertEqual(rc, 0)
+        self.assertIn("Šajā telefonā tas nav pieejams", out)
+        self.assertNotIn("config_wifiFrameworkSoftApShutDownTimeoutMilliseconds disabled", out)
+        self.assertIn("GALVENAIS: Izslēdz automātisko izslēgšanos", out)
+
+    def test_fix_on_android13_only_opens_settings(self):
+        self.responses({"get-state": "device\n", "shell getprop": "[ro.build.version.sdk]: [33]\n"})
+        rc, out = self.run_main("fix", "--yes")
+        self.assertEqual(rc, 0)
+        calls = self.calls.read_text()
+        self.assertNotIn("force-overlay-config-value", calls)
+        self.assertIn("shell am start -a com.android.settings.WIFI_TETHER_SETTINGS", calls)
+        self.assertNotIn("NEIZDEVĀS", out)
 
     def test_fix_asks_and_skips_on_no(self):
         self.responses({"get-state": "device\n", "shell getprop": "[ro.build.version.sdk]: [34]\n"})

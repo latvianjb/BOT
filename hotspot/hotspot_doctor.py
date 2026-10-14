@@ -146,8 +146,9 @@ CAUSES: List[Cause] = [
         "Android izslēdz hotspotu, ja noteiktu laiku (parasti 5-10 min) tam nav pieslēgta neviena "
         "ierīce. Tas notiek arī tad, ja dators/TV/planšete aizmieg vai uz brīdi atvienojas.",
         AUTO_OFF_FIX,
-        [r"Timeout message received(?!.{0,40}Dropping)",
-         r"soft ?ap\w*\W.{0,100}?\b(?:time ?out|timed out|idle)\b(?!.{0,30}(?:schedul|cancel|remov))",
+        # "... Timeout message received but has clients. Dropping." and similar lines are not stops.
+        [r"^(?!.*dropp).*?Timeout message received",
+         r"^(?!.*(?:schedul|cancel|remov|dropp)).*?soft ?ap\w*\W.{0,100}?\b(?:time ?out|timed out|idle)\b",
          r"\b(?:no|without) (?:connected )?(?:clients?|devices?|stations?)\b.{0,80}?"
          r"\b(?:time ?out|timer|expir\w*|stop\w*|shut\w*|turn\w* off)\b",
          r"\b(?:timer|time ?out)\b.{0,40}?\bexpir\w*.{0,60}?(?:hotspot|soft ?ap|mobile ?ap|tether)",
@@ -892,56 +893,101 @@ def _confirm(question: str, assume_yes: bool) -> bool:
 SHELL_ERROR_RE = re.compile(r"SecurityException|Permission denial|Exception|Error|not found|Unknown", re.I)
 
 
+SOFTAP_TIMEOUT_OVERLAY = "config_wifiFrameworkSoftApShutDownTimeoutMilliseconds"
+MAX_TIMEOUT_MS = 2**31 - 1  # ~24.8 days, the largest value the integer overlay accepts
+HOTSPOT_SETTINGS_INTENTS = ("com.android.settings.WIFI_TETHER_SETTINGS", "android.settings.TETHER_SETTINGS")
+XIAOMI_HINT = ("Xiaomi/Redmi/POCO: Izstrādātāja opcijas -> ieslēdz «USB atkļūdošana (Drošības iestatījumi)» "
+               "un mēģini vēlreiz.")
+
+
+@dataclass
+class FixAction:
+    description: str
+    commands: List[List[str]]  # alternatives: the first one that succeeds is enough
+    revert: str = ""
+    fail_hint: str = ""
+    done_note: str = ""
+
+
+def _fix_actions(sdk: int, glob: Dict[str, str], data_saver: bool, disable_offload: bool) -> List[FixAction]:
+    modern = sdk >= 30 or sdk == 0
+    actions = [FixAction(
+        f"Palielināt sistēmas žurnāla buferi līdz {LOG_BUFFER_SIZE}, lai iemesls nepazustu no žurnāla",
+        [["logcat", "-G", LOG_BUFFER_SIZE]], "adb logcat -G 256K")]
+    if 0 < sdk <= 29 and glob.get("soft_ap_timeout_enabled", "1") != "0":
+        actions.append(FixAction(
+            "Izslēgt hotspota automātisko izslēgšanos (soft_ap_timeout_enabled=0)",
+            [["shell", "settings put global soft_ap_timeout_enabled 0"]],
+            "adb shell settings put global soft_ap_timeout_enabled 1"))
+    if sdk >= 36 or sdk == 0:
+        # Android 11+ keeps the auto-off switch in the hotspot config, which adb cannot edit. The Android 16
+        # Wi-Fi module lets the shell override the default idle timeout instead; it lasts until reboot.
+        actions.append(FixAction(
+            "Pagarināt hotspota automātiskās izslēgšanās taimautu līdz ~24 dienām "
+            "(pēc telefona restarta jāatkārto)",
+            [["shell", f"cmd wifi force-overlay-config-value integer {SOFTAP_TIMEOUT_OVERLAY} enabled "
+                       f"{MAX_TIMEOUT_MS}"]],
+            f"adb shell cmd wifi force-overlay-config-value integer {SOFTAP_TIMEOUT_OVERLAY} disabled",
+            fail_hint="Šajā telefonā tas nav pieejams — izslēdz automātisko izslēgšanos iestatījumos (zemāk).",
+            done_note="Stāsies spēkā pēc hotspota izslēgšanas un ieslēgšanas. Ja hotspotam iestatīts savs "
+                      "taimauts (piem., Samsung), izslēdz slēdzi arī iestatījumos."))
+    if data_saver:
+        actions.append(FixAction(
+            "Izslēgt datu taupīšanas režīmu (Data Saver), kas aptur hotspotu",
+            [["shell", "cmd netpolicy set restrict-background false"]],
+            "adb shell cmd netpolicy set restrict-background true"))
+    if glob.get("low_power") == "1":
+        actions.append(FixAction(
+            "Izslēgt akumulatora taupīšanas režīmu",
+            [["shell", "settings put global low_power 0"]], "adb shell settings put global low_power 1"))
+    if glob.get("wifi_wakeup_enabled") == "1":
+        actions.append(FixAction(
+            "Izslēgt «Automātiski ieslēgt Wi-Fi» (Wi-Fi ieslēgšanās var noņemt hotspotu)",
+            [["shell", "settings put global wifi_wakeup_enabled 0"]],
+            "adb shell settings put global wifi_wakeup_enabled 1"))
+    if disable_offload and glob.get("tether_offload_disabled") != "1":
+        actions.append(FixAction(
+            "Izslēgt «Piesaistes aparatūras paātrinājums» (tethering offload)",
+            [["shell", "settings put global tether_offload_disabled 1"]],
+            "adb shell settings put global tether_offload_disabled 0"))
+    if modern:
+        actions.append(FixAction(
+            "Atvērt telefonā hotspota iestatījumus, lai izslēgtu «Automātiski izslēgt tīklāju»",
+            [["shell", f"am start -a {action}"] for action in HOTSPOT_SETTINGS_INTENTS],
+            fail_hint="Atver tos ar roku (ceļš zemāk).",
+            done_note="Atbloķē telefonu un izslēdz slēdzi «Automātiski izslēgt tīklāju» / «Turn off hotspot "
+                      "automatically» (Samsung: ⋮ -> Configure -> Advanced)."))
+    return actions
+
+
 def cmd_fix(args: argparse.Namespace) -> int:
     adb = Adb(args.adb, args.serial)
     adb.require_device()
     sdk = _sdk(parse_getprop(adb.shell("getprop", timeout=30)[1]))
     glob = parse_settings(adb.shell("settings list global", timeout=30)[1])
-    data_saver = re.search(r"\benabled\b", adb.shell("cmd netpolicy get restrict-background")[1], re.I)
-
-    # (description, adb args, revert hint)
-    actions: List[Tuple[str, List[str], str]] = [
-        (f"Palielināt sistēmas žurnāla buferi līdz {LOG_BUFFER_SIZE}, lai iemesls nepazustu no žurnāla",
-         ["logcat", "-G", LOG_BUFFER_SIZE], "adb logcat -G 256K"),
-    ]
-    if 0 < sdk <= 29 and glob.get("soft_ap_timeout_enabled", "1") != "0":
-        actions.append(("Izslēgt hotspota automātisko izslēgšanos (soft_ap_timeout_enabled=0)",
-                        ["shell", "settings put global soft_ap_timeout_enabled 0"],
-                        "adb shell settings put global soft_ap_timeout_enabled 1"))
-    if data_saver:
-        actions.append(("Izslēgt datu taupīšanas režīmu (Data Saver), kas aptur hotspotu",
-                        ["shell", "cmd netpolicy set restrict-background false"],
-                        "adb shell cmd netpolicy set restrict-background true"))
-    if glob.get("low_power") == "1":
-        actions.append(("Izslēgt akumulatora taupīšanas režīmu",
-                        ["shell", "settings put global low_power 0"],
-                        "adb shell settings put global low_power 1"))
-    if glob.get("wifi_wakeup_enabled") == "1":
-        actions.append(("Izslēgt «Automātiski ieslēgt Wi-Fi» (Wi-Fi ieslēgšanās var noņemt hotspotu)",
-                        ["shell", "settings put global wifi_wakeup_enabled 0"],
-                        "adb shell settings put global wifi_wakeup_enabled 1"))
-    if args.disable_offload and glob.get("tether_offload_disabled") != "1":
-        actions.append(("Izslēgt «Piesaistes aparatūras paātrinājums» (tethering offload)",
-                        ["shell", "settings put global tether_offload_disabled 1"],
-                        "adb shell settings put global tether_offload_disabled 0"))
+    data_saver = bool(re.search(r"\benabled\b", adb.shell("cmd netpolicy get restrict-background")[1], re.I))
 
     applied: List[str] = []
-    for description, adb_args, revert in actions:
-        if not _confirm(f"- {description}?", args.yes):
+    for action in _fix_actions(sdk, glob, data_saver, args.disable_offload):
+        if not _confirm(f"- {action.description}?", args.yes):
             continue
-        rc, out = adb.run(*adb_args, timeout=30)
-        if rc != 0 or SHELL_ERROR_RE.search(out):
-            print(f"  NEIZDEVĀS: {out.strip() or f'kods {rc}'}")
-            if re.search(r"SecurityException|permission denial", out, re.I):
-                print("  Xiaomi/Redmi/POCO: Izstrādātāja opcijas -> ieslēdz «USB atkļūdošana (Drošības "
-                      "iestatījumi)» un mēģini vēlreiz.")
-            continue
-        print("  Izdarīts.")
-        applied.append(revert)
+        for command in action.commands:
+            rc, out = adb.run(*command, timeout=30)
+            if rc == 0 and not SHELL_ERROR_RE.search(out):
+                print("  Izdarīts." + (f" {action.done_note}" if action.done_note else ""))
+                if action.revert:
+                    applied.append(action.revert)
+                break
+        else:
+            print(f"  NEIZDEVĀS: {_clip(out.strip(), 200) or f'kods {rc}'}")
+            if action.fail_hint:
+                print(f"  {action.fail_hint}")
+            elif re.search(r"SecurityException|permission denial", out, re.I):
+                print(f"  {XIAOMI_HINT}")
 
     print("\nPaliek izdarīt ar roku:")
     if sdk >= 30 or sdk == 0:
-        print(f"- {AUTO_OFF_FIX}")
+        print(f"- GALVENAIS: {AUTO_OFF_FIX}")
     print("- Hotspota iestatījumos izvēlies 2,4 GHz joslu (stabilāka, nav DFS radaru pārslēgšanās).")
     print("- Pārbaudi, vai pieslēgtā ierīce (dators) neaizmieg un neizslēdz Wi-Fi enerģijas taupīšanai.")
     print("- Pēc izmaiņām izslēdz un ieslēdz hotspotu no jauna.")

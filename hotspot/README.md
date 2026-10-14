@@ -65,14 +65,18 @@ logcat teksta failu.
 |---|---|---|
 | Žurnāla buferis 16 MB | vienmēr | `adb logcat -G 256K` |
 | `soft_ap_timeout_enabled=0` (automātiskā izslēgšanās) | Android 10 un vecāks | `adb shell settings put global soft_ap_timeout_enabled 1` |
+| Automātiskās izslēgšanās taimauts ~24 dienas (`cmd wifi force-overlay-config-value`) | Android 16+, līdz restartam | `adb shell cmd wifi force-overlay-config-value integer config_wifiFrameworkSoftApShutDownTimeoutMilliseconds disabled` |
 | Data Saver izslēgts | ja ieslēgts | `adb shell cmd netpolicy set restrict-background true` |
 | Akumulatora taupīšana izslēgta | ja ieslēgta | `adb shell settings put global low_power 1` |
 | «Automātiski ieslēgt Wi-Fi» izslēgts | ja ieslēgts | `adb shell settings put global wifi_wakeup_enabled 1` |
 | Piesaistes aparatūras paātrinājums izslēgts | tikai ar `--disable-offload` | `adb shell settings put global tether_offload_disabled 0` |
+| Telefonā atver hotspota iestatījumus | Android 11+ | — |
 
 Android 11 un jaunākā versijā automātiskās izslēgšanās slēdzis glabājas hotspota konfigurācijā, un
-ADB to mainīt nevar. Tā vietā `fix` parāda, kur to izslēgt iestatījumos. Rīks **neapiet**
-operatora ierobežojumus.
+bez root tiesībām ADB to mainīt nevar. Tāpēc `fix` atver telefonā hotspota iestatījumus, kur
+slēdzis «Automātiski izslēgt tīklāju» jāizslēdz ar roku. Android 16+ telefonos `fix` papildus
+pagarina noklusējuma taimautu līdz ~24 dienām. Šī izmaiņa pazūd pēc telefona restarta, tad `fix`
+jāpalaiž vēlreiz. Rīks **neapiet** operatora ierobežojumus.
 
 Privātums: atskaites mapē ir telefona tehniskā informācija (modelis, iestatījumi, žurnāls) — nepublicē
 to atklāti.
